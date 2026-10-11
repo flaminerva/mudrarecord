@@ -33,17 +33,47 @@ Created by Ondřej Bojar and Claude Opus 4.8 based on the [Prodilink](https://gi
 
 ## Sample Output
 
-Using the included ``live-viewer/live-viewer``, you can create 
+With the included ``live-viewer/live-viewer`` (needs `pyqtgraph` and PyQt5,
+see `live-viewer/requirements.txt`):
+
+```
+mudrarecord stream-csv | live-viewer/live-viewer --width=5s
+```
+
+you get a live plot of the last `--width` seconds: SNC raw (`snc1-3`), SNC
+RMS (`rms1-3`), acc in g and gyro in deg/s (nominal sensitivities; the gyro
+panel appears once gyro rows arrive), on one time axis in seconds before the
+newest row. The y axes are fixed to the full scale (SNC raw -32768..32767,
+RMS 0..32768, acc ±2 g, gyro ±250 deg/s). Railed SNC samples are `nan` in the
+CSV; with `--include-raw-bytes` the viewer reads their value from `raw_hex`,
+so railing is drawn at the panel edge:
+
+![Screenshot of four plots underneath each other](screenshot-of-sample-output.png)
+
+The original options still work: one panel per `--group` (1-based column
+numbers or ranges such as `4-9`, a wildcard on the column names such as
+`a*`, or a channel token such as `imu` selecting rows by their stream
+column). As before, each line of such a panel is scaled to the panel
+height on its own (y numbers hidden), and `--shared-range-groups` gives the
+listed panels one common real range:
 
 ```
 mudrarecord stream-csv \
 | live-viewer/live-viewer --width=5s \
-  --group=snc* --group=rms* --group=a* --shared-range-groups=1,2,3
+  --group='snc*' --group='rms*' --group='a*' --shared-range-groups=1,2,3
 ```
 
-you can get a live plot like this:
-
-![Screenshot of three plots underneath each other](screenshot-of-sample-output.png)
+Samples of one BLE packet share its arrival time. The viewer spreads SNC
+samples evenly over the time since the previous packet. acc / gyro samples
+go on the device clock when `device_ts` is present (8 per record, evenly over
+the record's device-time interval, mapped to host time by a running linear
+fit of arrival against device time), else they are spread like SNC. SNC RMS
+is shown as the RMS over the last 6 packets (display only). Each signal is
+plotted only where it has values, and a line breaks where two samples are
+more than twice the usual interval apart (so lost IMU records show as short
+gaps). SNC raw is drawn as the min / max per pixel column, the other lines
+as the min / max of a few hundred bins (peaks and railing stay visible),
+without antialiasing, so the viewer keeps up with a live session.
 
 ## Requirements
 
@@ -386,6 +416,8 @@ mudrarecord/
   device.py     - MudraBand: connect, info, HID off, channel enable, raw callbacks
   recorder.py   - CSVSink, LSLSink, decimation, raw decoders
   cli.py        - scan / info / stream-csv / stream-lsl
+live-viewer/
+  live-viewer   - live plot of a stream-csv stream (stdin)
 ```
 
 ## Testing
@@ -394,8 +426,9 @@ mudrarecord/
 pytest tests/ -v
 ```
 
-The tests cover the pure-Python decode, timestamp formatting, decimation, and
-CSV writing; no hardware is required.
+The tests cover the pure-Python decode (including the IMU record layout),
+timestamp formatting, decimation, CSV / LSL writing and the live-viewer's
+sample placement; no hardware is required.
 
 ## License
 

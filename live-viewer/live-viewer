@@ -1,1022 +1,563 @@
 #!/usr/bin/env python3
-"""live-viewer: fast real-time plotting of CSV values arriving on stdin.
+"""live-viewer: live plot of a mudrarecord CSV stream read from stdin.
 
-Reads a CSV stream on stdin (one record per line). The structure is guessed
-automatically from an optional header row and/or the first data rows:
+    mudrarecord stream-csv | live-viewer --width=5s
+    mudrarecord stream-csv | live-viewer --width=5s --group='snc*' \
+        --group='rms*' --group='a*' --shared-range-groups=1,2,3
 
-  * The timestamp column is the first column whose values are non-decreasing
-    and look like Unix timestamps (large integers / floats) or ISO-8601
-    strings.
-  * Columns that carry non-numeric string tokens are treated as "channel"
-    (group-selector) columns.
-  * The remaining columns are numeric data channels (int or float).
+Without --group: four panels on one time axis (seconds before the newest row): SNC raw
+(snc1-3), SNC RMS (rms1-3), acc in g (ax, ay, az) and gyro in deg/s (gx, gy,
+gz; shown once gyro rows arrive). Units use the nominal sensitivities; the y
+axes are fixed to the full scale (SNC raw -32768..32767, RMS 0..32768, acc
+±2 g, gyro ±250 deg/s).
 
-Plotting uses pyqtgraph (Qt/X11, no Tk) which is fast enough to keep up with
-data arriving at very high rates. A background thread parses stdin as fast as
-possible and fills ring buffers; the GUI redraws on a fixed timer, fully
-decoupled from the incoming data rate.
+With --group (upstream's options): one panel per --group, selecting value
+columns by 1-based column numbers / ranges ('4-9', '1,3,5'), a wildcard on
+the column names ('snc*', 'a*'), or rows by a channel token ('imu': rows
+whose stream column is imu, with the columns that carry data in such rows
+among the first 400 lines); raw CSV values. As upstream, each line of a
+panel is scaled separately to 0-1 of the panel (y numbers hidden), except in
+--shared-range-groups panels, which share one real range. Placement, gap breaks and min / max drawing are the same as below;
+the SNC RMS smoothing applies to the four-panel layout only.
 
-Ctrl-C (SIGINT) terminates the viewer. Use --width to keep only a trailing
-time window (e.g. 500ms, 3s, 2m, 1h) and roll out older data. When a channel
-receives no fresh samples inside the window it is held flat at its last known
-value (it does not disappear). Timestamps are shown as YYMMDD-hhmmss.
+mudrarecord writes railed SNC samples (-32768 / +32767) as nan; when the CSV
+has a raw_hex column the viewer reads their value from it, so railing is
+drawn at the edge of the SNC raw panel (without raw_hex they are gaps).
 
-Use --realtime-replay to pace a recorded CSV file fed on stdin according to
-its own timestamp column: the first timestamp is anchored to "now" and
-subsequent lines are held back so they are dispatched at the same pace they
-were originally recorded, simulating a live feed.
+Only the plotted columns are parsed (raw_hex only for rows with nan), and
+lines are drawn without antialiasing. SNC raw is reduced to the min / max of
+each pixel column (a dense band; peaks and railing stay visible), the other
+lines to the min / max of PEAK_BINS bins. Parsing runs in its own thread, so
+a slow frame lowers the frame rate but never delays reading stdin.
 
-See --help for options.
+A signal is plotted only at rows where it has a value. The rows of one BLE
+packet share its arrival time; SNC samples are spread evenly over the time
+since the previous packet (over the median packet interval after a gap).
+acc / gyro samples are placed on the device clock when the CSV has
+device_ts: the 8 samples of a record evenly over the device-time interval
+since the previous record (the timestamp is the last sample), mapped to host
+time by a running linear fit of arrival time against device time; without
+device_ts they are placed like SNC. SNC RMS shows the RMS over the last
+RMS_PACKETS packets' rms1-3 (display only), one point per packet.
+Consecutive samples more than 2x the median sample interval apart are not
+connected.
 """
-
-import sys
-import os
+import argparse
+import collections
+import fnmatch
+import itertools
 import re
 import signal
-import argparse
+import statistics
+import struct
+import sys
 import threading
-import collections
-import math
-import time
-import warnings
 
 import numpy as np
 
-# NaN values are used intentionally to create gaps in lines (missing samples
-# and pre-first-sample holds); silence the resulting all-NaN reductions.
-warnings.filterwarnings("ignore", message="All-NaN slice encountered")
-warnings.filterwarnings("ignore", message="Mean of empty slice")
+ACC_LSB_PER_G = 16384.0
+GYRO_LSB_PER_DPS = 131.072
+GAP_FACTOR = 2.0
+INTERVAL_HISTORY = 50          # packet intervals in the running median
+REDRAW_MS = 33
+LINE_WIDTH = 2.5
+RAW_LINE_WIDTH = 1             # SNC raw is a dense band; 1 px keeps a frame < 20 ms
+AXIS_WIDTH = 70                # px, same for every panel so the time axes line up
+PEAK_BINS = 400                # per curve: min and max of each bin are drawn
+RMS_PACKETS = 6                # SNC RMS display: RMS over the last 6 packets (~100 ms)
+FIT_RECORDS = 2000             # device-clock fit: last 2000 records (~10 s)
+FIT_EVERY = 50                 # ... refitted every 50 records
+FIT_MIN_SPAN_US = 1e6          # nominal 1 us ticks until the fit spans 1 s
+DEVICE_TS_MODULUS = 1 << 32
+# upstream's palette: 1 / x red, 2 / y blue, 3 / z green, then more for --group panels
+COLOURS = [(200, 30, 30), (30, 90, 200), (30, 150, 60), (200, 130, 0), (140, 50, 190),
+           (0, 150, 160), (190, 60, 140), (110, 100, 40), (60, 60, 60), (30, 170, 200),
+           (150, 90, 30), (90, 120, 20)]
+NON_VALUE_COLUMNS = {"timestamp_ns", "timestamp_iso", "stream", "raw_hex"}
+SAMPLE_LINES = 400             # as upstream: lines read ahead to prune channel-token groups
+SNC_RAW_COLUMNS = ("snc1", "snc2", "snc3")
+IMU_COLUMNS = ("ax", "ay", "az", "gx", "gy", "gz")
 
-
-# --------------------------------------------------------------------------
-# Configuration
-# --------------------------------------------------------------------------
-
-MAX_POINTS = 500_000          # ring buffer capacity per channel (points kept)
-REDRAW_INTERVAL_MS = 33       # ~30 fps GUI redraw, independent of data rate
-X_TICK_MS = 1000              # x-axis ticks every 1000 ms
-
-# Line palette tuned for a white background (dark, saturated, distinguishable).
-PALETTE = [
-    (200,  30,  30),   # red
-    ( 30,  90, 200),   # blue
-    ( 30, 150,  60),   # green
-    (200, 130,   0),   # orange
-    (140,  50, 190),   # purple
-    (  0, 150, 160),   # teal
-    (190,  60, 140),   # magenta/pink
-    (110, 100,  40),   # olive/brown
-    ( 60,  60,  60),   # dark grey
-    ( 30, 170, 200),   # cyan
-    (150,  90,  30),   # brown
-    ( 90, 120,  20),   # dark lime
+# key, title, CSV columns (also the legend names), scale, one value per packet
+PANELS = [
+    ("raw", "SNC raw", ("snc1", "snc2", "snc3"), 1.0, False),
+    ("snc", "SNC RMS", ("rms1", "rms2", "rms3"), 1.0, True),
+    ("acc", "acc (g)", ("ax", "ay", "az"), 1 / ACC_LSB_PER_G, False),
+    ("gyro", "gyro (deg/s)", ("gx", "gy", "gz"), 1 / GYRO_LSB_PER_DPS, False),
 ]
+# fixed y ranges: the sensors' full scale
+Y_RANGE = {"raw": (-32768, 32767), "snc": (0, 32768), "acc": (-2, 2), "gyro": (-250, 250)}
 
 
 def parse_duration(text):
-    """Parse a duration like '500ms', '3s', '2m', '1h' into milliseconds.
-    A bare number is interpreted as seconds. Returns float ms or None."""
-    if text is None:
-        return None
-    t = text.strip().lower()
-    m = re.fullmatch(r"([0-9]*\.?[0-9]+)\s*(ms|s|m|h)?", t)
+    m = re.fullmatch(r"\s*([0-9]*\.?[0-9]+)\s*(ms|s|m|h)?\s*", text)
     if not m:
-        raise argparse.ArgumentTypeError("invalid duration: %r" % text)
-    val = float(m.group(1))
-    unit = m.group(2) or "s"
-    factor = {"ms": 1.0, "s": 1000.0, "m": 60_000.0, "h": 3_600_000.0}[unit]
-    return val * factor
+        raise argparse.ArgumentTypeError(f"bad duration {text!r} (e.g. 500ms, 5s, 2m)")
+    return float(m.group(1)) * {"ms": 1e-3, "s": 1.0, "m": 60.0, "h": 3600.0}[m.group(2) or "s"]
 
 
-# --------------------------------------------------------------------------
-# CSV structure guessing
-# --------------------------------------------------------------------------
+class DeviceClock:
+    """Unwraps the u32 device timestamp and maps device ticks to host time
+    with a running least-squares line over the last FIT_RECORDS records."""
 
-def looks_like_number(tok):
-    if tok is None:
-        return False
-    tok = tok.strip()
-    if tok == "":
-        return None  # empty / missing: no information
-    try:
-        float(tok)
-        return True
-    except ValueError:
-        return False
+    def __init__(self):
+        self._raw = None
+        self._value = 0
+        self._dev = collections.deque(maxlen=FIT_RECORDS)
+        self._host = collections.deque(maxlen=FIT_RECORDS)
+        self._since = 0
+        self.fit = None                            # (mean device, mean host, s per tick)
 
-
-def looks_like_iso(tok):
-    if not tok:
-        return False
-    t = tok.strip()
-    # crude: has a 'T' and digits and ':' , or ends with Z
-    return ("T" in t and ":" in t and any(c.isdigit() for c in t)) or t.endswith("Z")
-
-
-def is_header_row(fields):
-    """A row is a header if none of its non-empty fields parse as numbers and
-    it does not look like a timestamp row."""
-    non_empty = [f for f in fields if f.strip() != ""]
-    if not non_empty:
-        return False
-    for f in non_empty:
-        if looks_like_number(f) or looks_like_iso(f):
-            return False
-    return True
-
-
-class Structure:
-    """Holds the guessed layout of the CSV stream."""
-
-    def __init__(self, ncols, header=None):
-        self.ncols = ncols
-        self.header = header                     # list[str] or None
-        self.ts_col = None                       # index of timestamp column
-        self.ts_is_iso = False
-        self.channel_cols = []                   # string/group-selector columns
-        self.numeric_cols = []                   # data channels
-        self.col_kind = ["?"] * ncols            # 'ts','chan','num','?'
-
-    def column_name(self, idx):
-        if self.header and idx < len(self.header) and self.header[idx].strip():
-            return self.header[idx].strip()
-        return "col%d" % (idx + 1)
-
-    def describe(self):
-        lines = ["Guessed CSV structure (%d columns):" % self.ncols]
-        for i in range(self.ncols):
-            lines.append("  [%2d] %-16s %s" %
-                         (i + 1, self.column_name(i), self.col_kind[i]))
-        return "\n".join(lines)
-
-
-def guess_structure(header, sample_rows):
-    """Guess structure from an optional header and a list of sample data rows
-    (each a list of string fields)."""
-    ncols = 0
-    if header:
-        ncols = len(header)
-    for r in sample_rows:
-        ncols = max(ncols, len(r))
-    st = Structure(ncols, header)
-
-    # Per-column analysis over the sample rows.
-    numeric_votes = [0] * ncols
-    string_votes = [0] * ncols
-    iso_votes = [0] * ncols
-    seen = [0] * ncols
-    col_values = [[] for _ in range(ncols)]
-
-    for r in sample_rows:
-        for i in range(ncols):
-            tok = r[i] if i < len(r) else ""
-            v = looks_like_number(tok)
-            if v is None:
-                continue  # empty
-            seen[i] += 1
-            if v:
-                numeric_votes[i] += 1
-                try:
-                    col_values[i].append(float(tok))
-                except ValueError:
-                    pass
-            else:
-                string_votes[i] += 1
-                if looks_like_iso(tok):
-                    iso_votes[i] += 1
-
-    # Find timestamp column: prefer the first column that is (a) numeric &
-    # non-decreasing & large, or (b) ISO strings & non-decreasing.
-    def non_decreasing(vals):
-        return all(vals[k] <= vals[k + 1] for k in range(len(vals) - 1))
-
-    ts_candidate = None
-    for i in range(ncols):
-        if seen[i] == 0:
-            continue
-        # ISO timestamp column
-        if iso_votes[i] > 0 and iso_votes[i] == string_votes[i]:
-            # ISO strings are lexically non-decreasing when chronological
-            vals = [r[i] for r in sample_rows if i < len(r) and r[i].strip()]
-            if len(vals) >= 2 and all(vals[k] <= vals[k + 1]
-                                      for k in range(len(vals) - 1)):
-                ts_candidate = (i, True)
-                break
-        # numeric timestamp: large magnitude & non-decreasing
-        if numeric_votes[i] > 0 and string_votes[i] == 0 and col_values[i]:
-            v = col_values[i]
-            if len(v) >= 2 and non_decreasing(v) and max(abs(x) for x in v) > 1e6:
-                ts_candidate = (i, False)
-                break
-
-    if ts_candidate is not None:
-        st.ts_col, st.ts_is_iso = ts_candidate
-        st.col_kind[st.ts_col] = "ts"
-
-    # Classify remaining columns.
-    for i in range(ncols):
-        if i == st.ts_col:
-            continue
-        if seen[i] == 0:
-            # no data seen; if header exists guess by nothing -> treat numeric
-            st.numeric_cols.append(i)
-            st.col_kind[i] = "num"
-            continue
-        if string_votes[i] > numeric_votes[i]:
-            # A string column. If it is (mostly) ISO timestamps it is an
-            # auxiliary time column, not a channel selector.
-            if iso_votes[i] > 0 and iso_votes[i] >= 0.5 * string_votes[i]:
-                st.col_kind[i] = "iso"     # ignored for plotting/selecting
-            else:
-                st.channel_cols.append(i)
-                st.col_kind[i] = "chan"
+    def unwrap(self, raw):
+        if self._raw is not None:
+            d = (raw - self._raw) % DEVICE_TS_MODULUS
+            self._value += d - DEVICE_TS_MODULUS if d >= DEVICE_TS_MODULUS // 2 else d
         else:
-            st.numeric_cols.append(i)
-            st.col_kind[i] = "num"
+            self._value = raw
+        self._raw = raw
+        return self._value
 
-    return st
+    def add(self, dev, host):
+        """One record: device time (unwrapped ticks) and host arrival (s)."""
+        self._dev.append(dev)
+        self._host.append(host)
+        self._since += 1
+        if self.fit is not None and self._since < FIT_EVERY:
+            return
+        self._since = 0
+        d = np.array(self._dev, float)
+        h = np.array(self._host, float)
+        dm, hm = d.mean(), h.mean()
+        slope = 1e-6
+        if d.max() - d.min() >= FIT_MIN_SPAN_US:
+            slope = float(np.sum((d - dm) * (h - hm)) / np.sum((d - dm) ** 2))
+        self.fit = (dm, hm, slope)
 
-
-# --------------------------------------------------------------------------
-# Timestamp parsing
-# --------------------------------------------------------------------------
-
-def parse_ts_numeric(tok):
-    """Return time in milliseconds (float). Auto-detects ns/us/ms/s scale."""
-    try:
-        v = float(tok)
-    except (ValueError, TypeError):
-        return None
-    a = abs(v)
-    if a > 1e17:      # nanoseconds
-        return v / 1e6
-    if a > 1e14:      # microseconds
-        return v / 1e3
-    if a > 1e11:      # milliseconds
-        return v
-    return v * 1000.0  # seconds
-
-
-def parse_ts_iso(tok):
-    """Parse ISO-8601 to milliseconds. Best effort without pulling in heavy
-    deps; nanosecond fractions are supported."""
-    try:
-        import datetime
-        t = tok.strip()
-        if t.endswith("Z"):
-            t = t[:-1] + "+00:00"
-        # datetime.fromisoformat handles up to microseconds; trim extra digits.
-        if "." in t:
-            head, frac = t.split(".", 1)
-            # frac may include timezone
-            tz = ""
-            for sep in ("+", "-"):
-                idx = frac.find(sep)
-                if idx > 0:
-                    tz = frac[idx:]
-                    frac = frac[:idx]
-                    break
-            frac6 = (frac + "000000")[:6]
-            t = head + "." + frac6 + tz
-        dt = datetime.datetime.fromisoformat(t)
-        return dt.timestamp() * 1000.0
-    except Exception:
-        return None
+    def to_host(self, dev):
+        dm, hm, slope = self.fit
+        return hm + (dev - dm) * slope
 
 
-# --------------------------------------------------------------------------
-# Group specification parsing
-# --------------------------------------------------------------------------
+class Signal:
+    """Samples of some CSV columns, (time, values), placed packet by packet
+    (SNC) or record by record (acc / gyro on the device clock)."""
 
-class GroupSpec:
-    """A --group specification. In priority order it is interpreted as:
+    def __init__(self, columns, scale, per_packet, keep_s, clock=None, smooth=False,
+                 stream=None):
+        self.columns = tuple(columns)
+        self.stream = stream                       # only rows whose stream column equals this
+        self.scale, self.per_packet, self.keep_s = scale, per_packet, keep_s
+        self.clock = clock                         # set: acc / gyro, device_ts used if present
+        self.smooth = smooth                       # SNC RMS panel: RMS over RMS_PACKETS packets
+        self.chunks = collections.deque()          # (times (n,), values (n, k), on device clock)
+        self._group_key = None
+        self._group_t = None
+        self._group_dev = None
+        self._group = []
+        self._last = None
+        self._intervals = collections.deque(maxlen=INTERVAL_HISTORY)
+        self._recent = collections.deque(maxlen=RMS_PACKETS)
+        self.lock = threading.Lock()
 
-      * a set of 1-based column numbers / ranges  (e.g. '4-9', '1,3,5')
-      * a wildcard pattern matching header column names (e.g. 'snc*', 'a*')
-      * a plain channel token selecting rows by a channel column's value
-        (e.g. 'imu', 'snc')
-    """
+    def add(self, t, values, dev=None):
+        """One CSV row with values for this signal: arrival time t (s) and,
+        for acc / gyro, the record's unwrapped device timestamp."""
+        if self.clock is None:
+            dev = None
+        key = t if dev is None else ("dev", dev)
+        if key != self._group_key:
+            self.flush()
+            self._group_key, self._group_t, self._group_dev = key, t, dev
+        self._group.append(values)
 
-    def __init__(self, raw):
-        self.raw = raw
-        self.columns = None    # explicit 0-based column indices, or None
-        self.pattern = None    # header-name wildcard pattern, or None
-        self.channel = None    # channel token string, or None
-
-        cols = self._try_parse_columns(raw)
-        if cols is not None:
-            self.columns = cols
-        elif any(ch in raw for ch in "*?[") :
-            self.pattern = raw
+    def flush(self):
+        """Place the pending packet's (record's) samples in time."""
+        if not self._group:
+            return
+        group, self._group = self._group, []
+        on_device = self._group_dev is not None
+        stamp = self._group_dev if on_device else self._group_t
+        if on_device:
+            self.clock.add(stamp, self._group_t)
+        span = 0.0
+        if self._last is not None and self._last[0] == on_device:
+            span = stamp - self._last[1]
+            normal = statistics.median(self._intervals) if self._intervals else span
+            self._intervals.append(span)
+            if span > GAP_FACTOR * normal:
+                span = normal
         else:
-            self.channel = raw
+            self._intervals.clear()
+        self._last = (on_device, stamp)
+        if self.per_packet:                        # RMS: one value per packet
+            group = group[-1:]
+        if self.smooth:
+            self._recent.append(group[-1])
+            r = np.array(self._recent, float)
+            with np.errstate(invalid="ignore", divide="ignore"):
+                group = [np.sqrt(np.nansum(r ** 2, axis=0) / np.sum(~np.isnan(r), axis=0))]
+        n = len(group)
+        times = stamp - span * (n - 1 - np.arange(n)) / n
+        values = np.array(group, float) * self.scale
+        keep = self.keep_s * (1e6 if on_device else 1.0)
+        with self.lock:
+            self.chunks.append((times, values, on_device))
+            while self.chunks and self.chunks[0][0][-1] < stamp - keep:
+                self.chunks.popleft()
 
-    @staticmethod
-    def _try_parse_columns(raw):
-        """Parse '4-9', '1,3,5', '4-9,11' -> list of 0-based indices, else None."""
-        cols = []
-        parts = raw.split(",")
-        for p in parts:
-            p = p.strip()
-            if not p:
-                continue
-            if "-" in p:
-                a, _, b = p.partition("-")
-                if not (a.strip().isdigit() and b.strip().isdigit()):
-                    return None
-                lo, hi = int(a), int(b)
-                if lo > hi:
-                    lo, hi = hi, lo
-                cols.extend(range(lo - 1, hi))  # 1-based inclusive -> 0-based
-            else:
-                if not p.isdigit():
-                    return None
-                cols.append(int(p) - 1)
-        return cols if cols else None
-
-
-# --------------------------------------------------------------------------
-# Channel: a single plotted line with its own ring buffer & autoscale
-# --------------------------------------------------------------------------
-
-class Channel:
-    __slots__ = ("name", "col", "xs", "ys", "present", "count",
-                 "vmin", "vmax", "last_val", "curve", "scatter",
-                 "dirty", "scatter_count")
-
-    def __init__(self, name, col):
-        self.name = name
-        self.col = col                       # source column index
-        self.xs = np.empty(MAX_POINTS, dtype=np.float64)
-        self.ys = np.empty(MAX_POINTS, dtype=np.float64)
-        self.present = np.empty(MAX_POINTS, dtype=bool)  # True if real point
-        self.count = 0
-        self.vmin = math.inf
-        self.vmax = -math.inf
-        self.last_val = math.nan
-        self.curve = None
-        self.scatter = None
-        self.dirty = False
-        self.scatter_count = -1   # count at last scatter setData
-
-    def append(self, x, val_or_none):
-        i = self.count
-        if i >= MAX_POINTS:
-            # shift out oldest half (rare with big buffer); keep it simple.
-            keep = MAX_POINTS // 2
-            self.xs[:keep] = self.xs[MAX_POINTS - keep:]
-            self.ys[:keep] = self.ys[MAX_POINTS - keep:]
-            self.present[:keep] = self.present[MAX_POINTS - keep:]
-            self.count = keep
-            i = keep
-        self.xs[i] = x
-        if val_or_none is None:
-            # missing: hold last known value, but not a real point
-            self.ys[i] = self.last_val
-            self.present[i] = False
-        else:
-            self.ys[i] = val_or_none
-            self.present[i] = True
-            self.last_val = val_or_none
-            if val_or_none < self.vmin:
-                self.vmin = val_or_none
-            if val_or_none > self.vmax:
-                self.vmax = val_or_none
-        self.count += 1
-        self.dirty = True
-
-    def prune(self, x_lo):
-        """Drop samples older than x_lo so the buffer does not grow without
-        bound. One sample strictly before x_lo is kept so the line/scale still
-        knows the value 'in effect' at the left edge. The array shift is
-        amortized: it only runs once the dead prefix is sizeable. Returns True
-        if anything was dropped."""
-        n = self.count
-        if n == 0:
-            return False
-        # index of first sample inside the window
-        i0 = int(np.searchsorted(self.xs[:n], x_lo, side="left"))
-        drop = i0 - 1          # keep one sample to the left of the window
-        # Only compact when the dead prefix is worth the O(n) shift.
-        if drop < 512 and drop < (n >> 2):
-            return False
-        keep = n - drop
-        self.xs[:keep] = self.xs[drop:n]
-        self.ys[:keep] = self.ys[drop:n]
-        self.present[:keep] = self.present[drop:n]
-        self.count = keep
-        # scatter_count tracks absolute appends; force a scatter refresh.
-        self.scatter_count = -1
-        # Recompute vmin/vmax from the retained real samples.
-        pres = self.present[:keep]
-        if pres.any():
-            seg = self.ys[:keep][pres]
-            self.vmin = float(seg.min())
-            self.vmax = float(seg.max())
-        else:
-            self.vmin = math.inf
-            self.vmax = -math.inf
-        return True
+    def arrays(self):
+        """(host times in s (n,), values (n, k))."""
+        with self.lock:
+            chunks = list(self.chunks)
+        if not chunks:
+            return np.zeros(0), np.zeros((0, len(self.columns)))
+        t = np.concatenate([c[0] for c in chunks])
+        if self.clock is not None and self.clock.fit is not None:
+            dev = np.concatenate([np.full(len(c[0]), c[2]) for c in chunks])
+            if dev.any():
+                t = np.where(dev, self.clock.to_host(t), t)
+        return t, np.concatenate([c[1] for c in chunks])
 
 
-# --------------------------------------------------------------------------
-# Fast stdin reader thread
-# --------------------------------------------------------------------------
+def make_signals(keep_s):
+    """Default layout: one Signal per panel; acc and gyro share one device clock."""
+    clock = DeviceClock()
+    return {key: Signal(cols, scale, per_packet, keep_s,
+                        clock if key in ("acc", "gyro") else None, smooth=key == "snc")
+            for key, _, cols, scale, per_packet in PANELS}
+
+
+def default_panels():
+    """[{title, curves [(signal key, value index, legend name)], y_range, key}]"""
+    return [{"key": key, "title": title, "y_range": Y_RANGE[key], "lazy": key == "gyro",
+             "curves": [(key, i, c) for i, c in enumerate(cols)]}
+            for key, title, cols, _, _ in PANELS]
+
+
+def group_columns(spec, header, sample_rows=()):
+    """(value columns, stream token or None) of one --group, as upstream:
+    1-based column numbers / ranges ('4-9', '1,3,5'); a wildcard on the column
+    names ('snc*'); otherwise a channel token ('imu'): rows whose stream column
+    equals it, with the value columns that have data in such rows among the
+    sample rows (all value columns if none match)."""
+    values = [h for h in header if h not in NON_VALUE_COLUMNS]
+    numbers = []
+    for part in filter(None, (p.strip() for p in spec.split(","))):
+        a, dash, b = part.partition("-")
+        if not (a.isdigit() and (not dash or b.isdigit())):
+            numbers = None
+            break
+        lo, hi = sorted((int(a), int(b))) if dash else (int(a), int(a))
+        numbers += [header[i - 1] for i in range(lo, hi + 1) if 0 < i <= len(header)]
+    if numbers is not None and numbers:
+        return numbers, None                       # any column, as upstream
+    if any(ch in spec for ch in "*?["):
+        return [c for c in values if fnmatch.fnmatch(c, spec)], None
+    if "stream" not in header:
+        sys.exit(f"live-viewer: --group {spec!r}: a channel token needs a 'stream' column")
+    si = header.index("stream")
+    nonempty = {c for r in sample_rows if si < len(r) and r[si].strip() == spec
+                for i, c in enumerate(header) if c in values and i < len(r) and r[i].strip()}
+    return ([c for c in values if c in nonempty] if nonempty else values), spec
+
+
+def group_layout(header, specs, keep_s, sample_rows=()):
+    """--group mode: (signals, panels). One Signal per column (raw CSV values;
+    rms per packet; acc / gyro columns on the device clock if device_ts exists);
+    a channel-token group gets its own Signals that take only its rows."""
+    clock = DeviceClock() if "device_ts" in header else None
+    signals, panels = {}, []
+    for spec in specs:
+        cols, token = group_columns(spec, header, sample_rows)
+        keys = [c if token is None else f"{token}:{c}" for c in cols]
+        for key, c in zip(keys, cols):
+            if key not in signals:
+                signals[key] = Signal((c,), 1.0, c.startswith("rms"), keep_s,
+                                      clock if c in IMU_COLUMNS else None, stream=token)
+        panels.append({"key": spec, "title": spec, "y_range": None,
+                       "curves": [(k, 0, c) for k, c in zip(keys, cols)]})
+    return signals, panels
+
+
+def shared_groups(text, n):
+    """--shared-range-groups '1,3,4' -> 0-based panel indices."""
+    out = set()
+    for p in filter(None, (q.strip() for q in text.split(","))):
+        if not p.isdigit() or not 1 <= int(p) <= n:
+            sys.exit(f"live-viewer: --shared-range-groups: no group {p!r}")
+        out.add(int(p) - 1)
+    return out
+
+
+def normalize(y):
+    """As upstream for non-shared --group panels: map a line's visible
+    [min, max] onto [0, 1]; a flat line is drawn at 0.5."""
+    finite = y[np.isfinite(y)]
+    if not finite.size:
+        return y
+    lo, hi = float(finite.min()), float(finite.max())
+    return y - lo + 0.5 if hi <= lo else (y - lo) / (hi - lo)
+
+
+def y_ranges(data, shared):
+    """Autoscale: (lo, hi) per panel from its visible values; panels in
+    `shared` get their common min / max. data: [list of value arrays]."""
+    def span(arrays):
+        v = np.concatenate([a[np.isfinite(a)] for a in arrays] or [np.zeros(0)])
+        if not v.size:
+            return None
+        lo, hi = float(v.min()), float(v.max())
+        return (lo - 1, hi + 1) if lo == hi else (lo, hi)
+    out = [span(a) for a in data]
+    common = span([a for i in shared for a in data[i]])
+    return [common if i in shared else r for i, r in enumerate(out)]
+
+
+def connect_mask(t):
+    """pyqtgraph 'connect' array: False where the next sample is more than
+    GAP_FACTOR x the median sample interval away."""
+    if len(t) < 2:
+        return np.zeros(len(t), bool)
+    d = np.diff(t)
+    return np.r_[d <= GAP_FACTOR * np.median(d), False]
+
+
+def peak_decimate(x, y, conn, bins=PEAK_BINS):
+    """Keep the min and the max of each of `bins` index bins (in time order),
+    so peaks and railing stay visible; two kept points are connected only if
+    no break lies between them. NaN never wins a bin unless the bin is all NaN."""
+    n = len(x)
+    if n <= 2 * bins:
+        return x, y, conn
+    k = -(-n // bins)
+    m = n // k * k
+    lo = np.where(np.isnan(y[:m]), np.inf, y[:m]).reshape(-1, k).argmin(axis=1)
+    hi = np.where(np.isnan(y[:m]), -np.inf, y[:m]).reshape(-1, k).argmax(axis=1)
+    base = np.arange(0, m, k)
+    idx = np.sort(np.r_[base + lo, base + hi, np.arange(m, n)])
+    breaks = np.r_[0, np.cumsum(~conn[:-1])]          # breaks before each sample
+    return x[idx], y[idx], np.r_[breaks[idx[1:]] == breaks[idx[:-1]], False]
+
 
 class Reader(threading.Thread):
-    def __init__(self, structure, plan, line_source, realtime_replay=False):
+    """Parses CSV lines into the panels' signals."""
+
+    def __init__(self, stream, header, signals):
         super().__init__(daemon=True)
-        self.st = structure
-        self.plan = plan            # list of (channels, match_col, match_val)
-        self.line_source = line_source   # iterable of raw lines (str)
-        self.lock = threading.Lock()
-        self.stop_flag = False
-        self.eof = False
-        self._synth = 0
-        self.realtime_replay = realtime_replay
-        self._replay_first_x = None    # timestamp (ms) of the first real sample
-        self._replay_start_wall = None  # time.monotonic() at that first sample
+        self.stream = stream
+        idx = {name: i for i, name in enumerate(header)}
+        if "timestamp_ns" not in idx:
+            sys.exit("live-viewer: no timestamp_ns column in the CSV header")
+        self.ts_col = idx["timestamp_ns"]
+        cols = {key: [idx[c] for c in s.columns] for key, s in signals.items()
+                if all(c in idx for c in s.columns)}
+        # parse only from the first plotted column to the end of the line
+        # (skips raw_hex and the other leading columns)
+        self.first = min(min(c) for c in cols.values()) if cols else len(header)
+        self.n_tail = len(header) - self.first
+        self.cols = {key: [c - self.first for c in cs] for key, cs in cols.items()}
+        self.raw_col = idx.get("raw_hex")
+        dts = idx.get("device_ts")
+        self.dev_col = dts - self.first if dts is not None and dts >= self.first else None
+        snc = idx.get("snc1")
+        self.snc_col = snc - self.first if snc is not None and snc >= self.first else None
+        self.stream_col = idx.get("stream") if any(s.stream for s in signals.values()) else None
+        self.snc_chans = {key: [SNC_RAW_COLUMNS.index(c) for c in s.columns]
+                          for key, s in signals.items()
+                          if key in self.cols and set(s.columns) <= set(SNC_RAW_COLUMNS)}
+        self._snc_ts, self._snc_row = None, 0     # current SNC packet, row within it
+        self._decoded = (None, ())                # (timestamp, its 54 raw values)
+        self.signals = signals
+        self.latest = None
+
+    def _railed(self, line, ts, k):
+        """[snc1, snc2, snc3] of row k of this packet from raw_hex (the CSV
+        has nan for railed samples), or None without raw_hex."""
+        if self.raw_col is None:
+            return None
+        if self._decoded[0] != ts:
+            try:
+                raw = bytes.fromhex(line.split(",", self.raw_col + 1)[self.raw_col])
+                self._decoded = (ts, struct.unpack_from("<54h", raw))
+            except (ValueError, struct.error):
+                self._decoded = (ts, ())
+        vals = self._decoded[1]
+        return [float(v) for v in vals[3 * k:3 * k + 3]] if 3 * k + 3 <= len(vals) else None
+
+    def feed(self, line):
+        line = line.rstrip("\r\n")
+        if self.ts_col == 0:
+            ts = line[:line.find(",")]
+        else:
+            ts = line.split(",", self.ts_col + 1)[self.ts_col]
+        try:
+            t = int(ts) / 1e9
+        except ValueError:
+            return
+        if self.first == 0:
+            f = line.split(",")
+        else:
+            f = line.rsplit(",", self.n_tail)[1:] if self.n_tail else []
+        row_stream = None
+        if self.stream_col is not None:
+            parts = line.split(",", self.stream_col + 1)
+            row_stream = parts[self.stream_col].strip() if self.stream_col < len(parts) else None
+        if self.snc_chans and self.snc_col is not None and self.snc_col < len(f) and f[self.snc_col]:
+            if ts != self._snc_ts:                 # row number within its SNC packet
+                self._snc_ts, self._snc_row = ts, 0
+            else:
+                self._snc_row += 1
+        for key, cols in self.cols.items():
+            if self.signals[key].stream is not None and self.signals[key].stream != row_stream:
+                continue
+            cells = [f[c] if c < len(f) else "" for c in cols]
+            if all(cells):
+                try:
+                    values = [float(c) for c in cells]
+                except ValueError:
+                    continue
+                if key in self.snc_chans and "nan" in cells:
+                    full = self._railed(line, ts, self._snc_row)
+                    if full:
+                        values = [full[c] for c in self.snc_chans[key]]
+                dev = None
+                clock = self.signals[key].clock
+                if clock is not None and self.dev_col is not None:
+                    cell = f[self.dev_col] if self.dev_col < len(f) else ""
+                    if cell:
+                        dev = clock.unwrap(int(cell))
+                self.signals[key].add(t, values, dev)
+        self.latest = t if self.latest is None else max(self.latest, t)
 
     def run(self):
-        st = self.st
-        ts_col = st.ts_col
-        ts_iso = st.ts_is_iso
-        for line in self.line_source:
-            if self.stop_flag:
-                break
-            line = line.rstrip("\n").rstrip("\r")
-            if not line:
-                continue
-            fields = line.split(",")
-            if ts_col is not None and ts_col < len(fields):
-                x = parse_ts_iso(fields[ts_col]) if ts_iso \
-                    else parse_ts_numeric(fields[ts_col])
-            else:
-                x = None
-            if x is None:
-                self._synth += 1
-                x = float(self._synth)
-            elif self.realtime_replay:
-                self._pace(x)
-            self._dispatch(fields, x)
-        self.eof = True
-
-    def _pace(self, x_ms):
-        """Block until wall-clock time has advanced by as much as x_ms has
-        advanced since the first timestamped sample (which is anchored to
-        'now')."""
-        now = time.monotonic()
-        if self._replay_first_x is None:
-            self._replay_first_x = x_ms
-            self._replay_start_wall = now
-            return
-        target_wall = self._replay_start_wall + (x_ms - self._replay_first_x) / 1000.0
-        while not self.stop_flag:
-            now = time.monotonic()
-            delay = target_wall - now
-            if delay <= 0:
-                break
-            time.sleep(min(delay, 0.2))
-
-    def _dispatch(self, fields, x):
-        plan = self.plan
-        with self.lock:
-            for (channels, match_col, match_val) in plan:
-                if match_col is not None:
-                    # channel-token group: only rows whose channel column matches
-                    v = fields[match_col].strip() if match_col < len(fields) else ""
-                    if v != match_val:
-                        continue
-                for ch in channels:
-                    c = ch.col
-                    tok = fields[c].strip() if c < len(fields) else ""
-                    if tok == "":
-                        ch.append(x, None)
-                    else:
-                        try:
-                            val = float(tok)
-                        except ValueError:
-                            ch.append(x, None)
-                            continue
-                        # Treat NaN/inf (incl. literal "nan") as missing: hold
-                        # the last value and draw no point.
-                        if val != val or val in (float("inf"), float("-inf")):
-                            ch.append(x, None)
-                        else:
-                            ch.append(x, val)
+        for line in self.stream:
+            self.feed(line)
+        for s in self.signals.values():
+            s.flush()
 
 
-# --------------------------------------------------------------------------
-# Building plot groups from specs & structure
-# --------------------------------------------------------------------------
-
-def build_groups(st, specs, sample_rows):
-    """Return (groups, group_titles, plan).
-
-    groups: list of list[Channel]
-    group_titles: list[str]
-    plan: list of (channels, match_col, match_val) for the reader
-    sample_rows is used to prune all-empty numeric columns from channel-token
-    groups (e.g. the 'imu' group should not list the always-empty snc columns).
-    """
-    numeric_set = set(st.numeric_cols)
-    groups = []
-    titles = []
-    plan = []
-
-    if not specs:
-        specs = [None]  # single default group: all numeric columns
-
-    # For disambiguating duplicate line names across the whole viewer we
-    # dedupe within each group.
-    for gi, spec in enumerate(specs):
-        channels = []
-        match_col = None
-        match_val = None
-        title = None
-
-        if spec is None:
-            cols = list(st.numeric_cols)
-            title = "all"
-        elif spec.columns is not None:
-            cols = [c for c in spec.columns if 0 <= c < st.ncols]
-            title = spec.raw
-        elif spec.pattern is not None:
-            # wildcard on header column names (numeric columns only)
-            import fnmatch
-            title = spec.raw
-            cols = []
-            for c in st.numeric_cols:
-                name = st.header[c].strip() if (st.header and c < len(st.header)) else ""
-                if name and fnmatch.fnmatch(name, spec.pattern):
-                    cols.append(c)
-        else:
-            # channel token: match rows where a channel column == token,
-            # plot all numeric columns that actually carry data for that token.
-            match_val = spec.channel
-            title = spec.channel
-            if st.channel_cols:
-                match_col = st.channel_cols[0]
-            cols = list(st.numeric_cols)
-            # Prune numeric columns that are always empty for matching rows.
-            if match_col is not None:
-                nonempty = set()
-                for r in sample_rows:
-                    if match_col < len(r) and r[match_col].strip() == match_val:
-                        for c in cols:
-                            if c < len(r) and r[c].strip() != "":
-                                nonempty.add(c)
-                if nonempty:
-                    cols = [c for c in cols if c in nonempty]
-
-        # Build channel objects with names.
-        have_header = bool(st.header)
-        # Determine raw names from the header if present.
-        raw_names = []
-        for c in cols:
-            if have_header and c < len(st.header) and st.header[c].strip():
-                raw_names.append(st.header[c].strip())
-            else:
-                raw_names.append(None)   # no usable header name
-
-        if all(n is not None for n in raw_names) and raw_names:
-            # Use header names, disambiguating duplicates with an index.
-            counts = collections.Counter(raw_names)
-            seen = collections.Counter()
-            for c, rn in zip(cols, raw_names):
-                if counts[rn] > 1:
-                    seen[rn] += 1
-                    name = "%s-%d" % (rn, seen[rn])
-                else:
-                    name = rn
-                channels.append(Channel(name, c))
-        else:
-            # No usable header: name channels <base>-<n>.
-            base = title if (title and title != "all") else "G"
-            for idx, c in enumerate(cols, 1):
-                channels.append(Channel("%s-%d" % (base, idx), c))
-
-        groups.append(channels)
-        titles.append(title or ("G%d" % (gi + 1)))
-        plan.append((channels, match_col, match_val))
-
-    return groups, titles, plan
-
-
-# --------------------------------------------------------------------------
-# GUI
-# --------------------------------------------------------------------------
-
-def _visible_range(ch, x_lo):
-    """Min/max of the values *in effect* for a channel from x_lo onward.
-
-    Includes the real samples at/after x_lo, plus the value held-forward from
-    just before x_lo (so a channel that is flat across the whole window still
-    reports a valid range). Returns (lo, hi) or (None, None) if the channel has
-    never had a real value.
-    """
-    n = ch.count
-    if n == 0 or not math.isfinite(ch.vmin):
-        return (None, None)
-    xs = ch.xs[:n]
-    i0 = int(np.searchsorted(xs, x_lo, side="left"))
-    pres = ch.present[i0:n]
-    lo = math.inf
-    hi = -math.inf
-    if pres.any():
-        seg = ch.ys[i0:n][pres]
-        lo = float(seg.min())
-        hi = float(seg.max())
-    # include the held value in effect at the left edge
-    if i0 > 0:
-        held = ch.ys[i0 - 1]
-        if math.isfinite(held):
-            lo = min(lo, held)
-            hi = max(hi, held)
-    if not math.isfinite(lo):
-        return (None, None)
-    return (lo, hi)
-
-
-def run_gui(structure, groups, titles, reader, shared_groups, style, width_ms):
+def run_gui(reader, signals, width, panels=None, shared=frozenset()):
+    """panels: default_panels() (fixed full-scale y axes) or group_layout()
+    panels (each line scaled to 0-1, as upstream; panels whose index is in
+    `shared` share one real range)."""
     import pyqtgraph as pg
-    from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
+    from pyqtgraph.Qt import QtCore, QtWidgets
 
-    # Keep rendering cheap: no antialiasing (huge cost with many line
-    # segments) and clip to the viewport. No point subsampling: every point
-    # in the window is drawn. Scatter symbols are the expensive part, so their
-    # data is set only when new samples arrive; per-channel scaling and window
-    # scrolling are done via a cheap Y transform + X range change each frame.
-    pg.setConfigOptions(antialias=False, useOpenGL=False,
-                        background="w", foreground="k")
+    panels = panels or default_panels()
+    pg.setConfigOptions(antialias=False, background="w", foreground="k")
+    app = pg.mkQApp("live-viewer")
+    win = pg.GraphicsLayoutWidget(title="live-viewer")
+    win.resize(1100, max(750, 190 * len(panels)))
+    win.ci.layout.setColumnFixedWidth(1, 70)      # legend column, outside the plots
+    plots = {}                                    # panel index -> (plot, [(curve, signal, index)])
 
-    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
-
-    # Make Ctrl-C (SIGINT) terminate the application. Python signal handlers
-    # only run between bytecode ops, so we also nudge the Qt event loop with a
-    # periodic no-op timer to give the interpreter a chance to react.
-    def _sigint(_sig, _frm):
-        reader.stop_flag = True
-        app.quit()
-    signal.signal(signal.SIGINT, _sigint)
-    try:
-        signal.signal(signal.SIGTERM, _sigint)
-    except Exception:
-        pass
-
-    win = pg.GraphicsLayoutWidget(show=True, title="live-viewer")
-    win.resize(1200, 200 + 260 * len(groups))
-
-    palette = PALETTE
-
-    style = style.lower()
-    draw_line = style in ("lines", "linespoints")
-    draw_points = style in ("points", "linespoints")
-
-    class MsAxis(pg.AxisItem):
-        """X axis showing timestamps as YYMMDD-hhmmss, with a tick roughly
-        every X_TICK_MS ms (subject to available space)."""
-        def tickValues(self, minVal, maxVal, size):
-            if not math.isfinite(minVal) or not math.isfinite(maxVal) \
-                    or maxVal <= minVal:
-                return []
-            # Choose a tick spacing that is a multiple of X_TICK_MS but keeps
-            # the number of labels reasonable for the current width.
-            span = maxVal - minVal
-            spacing = X_TICK_MS
-            max_ticks = max(2, int((size or 600) / 90))  # ~90 px per label
-            while span / spacing > max_ticks:
-                spacing *= 2
-            start = math.ceil(minVal / spacing) * spacing
-            majors = []
-            v = start
-            while v <= maxVal and len(majors) < 2000:
-                majors.append(v)
-                v += spacing
-            return [(spacing, majors)]
-
-        def tickStrings(self, values, scale, spacing):
-            import datetime
-            out = []
-            for v in values:
-                try:
-                    dt = datetime.datetime.fromtimestamp(v / 1000.0)
-                    out.append(dt.strftime("%y%m%d-%H%M%S"))
-                except (ValueError, OSError, OverflowError):
-                    out.append("%.0f" % v)
-            return out
-
-    shared = set(shared_groups)
-
-    plots = []
-    for gi, (channels, title) in enumerate(zip(groups, titles)):
-        p = win.addPlot(row=gi, col=0, title=title,
-                        axisItems={"bottom": MsAxis(orientation="bottom")})
-        p.showGrid(x=True, y=True, alpha=0.3)
-        p.setMouseEnabled(x=False, y=False)   # auto-follow the rolling window
-        # Y-axis values are only meaningful for shared-range groups. Non-shared
-        # groups normalise each channel independently to [0,1], so their y-axis
-        # numbers are meaningless -> hide the tick labels there.
-        if gi not in shared:
-            p.getAxis("left").setStyle(showValues=False)
-            p.getAxis("left").setWidth(20)
-        # Clip drawing to the viewport so off-screen points cost nothing, but
-        # do NOT downsample: every point inside the window must be drawn.
-        p.setClipToView(True)
-        p.addLegend(offset=(-10, 10))         # legend on the right side
-        legend = p.legend
-        try:
-            legend.anchor(itemPos=(1, 0), parentPos=(1, 0), offset=(-10, 10))
-        except Exception:
-            pass
-        for ci, ch in enumerate(channels):
-            color = palette[ci % len(palette)]
-            if draw_line:
-                ch.curve = p.plot([], [], pen=pg.mkPen(color=color, width=1),
-                                  name=ch.name, connect="finite")
-                ch.curve.setClipToView(True)
-            if draw_points:
-                ch.scatter = pg.ScatterPlotItem(
-                    size=5, brush=pg.mkBrush(color), pen=None)
-                p.addItem(ch.scatter)
-                if not draw_line:
-                    p.legend.addItem(ch.scatter, ch.name)
-        plots.append(p)
-
-    def window_bounds():
-        """Return (x_lo, x_hi) of the rolling window, or None if no data."""
-        xmax = -math.inf
-        for channels in groups:
-            for ch in channels:
-                if ch.count:
-                    v = ch.xs[ch.count - 1]
-                    if v > xmax:
-                        xmax = v
-        if not math.isfinite(xmax):
-            return None
-        if width_ms is not None:
-            return (xmax - width_ms, xmax)
-        # no --width: show everything from the earliest sample
-        xmin = math.inf
-        for channels in groups:
-            for ch in channels:
-                if ch.count and ch.xs[0] < xmin:
-                    xmin = ch.xs[0]
-        if not math.isfinite(xmin):
-            xmin = xmax
-        return (xmin, xmax)
-
-    def _set_y_transform(item, lo, hi):
-        """Map real y-values [lo,hi] onto the subplot's [0,1] band via a cheap
-        item transform (no data rebuild): y' = (y - lo) / (hi - lo).
-        A flat channel (hi == lo) is drawn centred at y' = 0.5."""
-        tr = QtGui.QTransform()
-        if hi <= lo:
-            # constant value -> draw centred: y' = 0.5 (use span 1 around value)
-            tr.scale(1.0, 1.0)
-            tr.translate(0.0, 0.5 - lo)
+    def add_panel(row):
+        panel = panels[row]
+        plot = win.addPlot(row=row, col=0, title=panel["title"])
+        plot.showGrid(x=True, y=True, alpha=0.2)
+        plot.getAxis("left").setWidth(AXIS_WIDTH)
+        plot.setXRange(-width, 0, padding=0)
+        plot.setMouseEnabled(x=False, y=False)
+        plot.disableAutoRange()
+        if panel["y_range"] is not None:
+            plot.setYRange(*panel["y_range"], padding=0)
+        elif row not in shared:                   # as upstream: each line scaled to 0-1,
+            plot.setYRange(0.0, 1.0, padding=0.02)    # so the y numbers mean nothing
+            plot.getAxis("left").setStyle(showValues=False)
+        if plots:
+            plot.setXLink(plots[min(plots)][0])
+        legend = pg.LegendItem()
+        fixed = QtWidgets.QSizePolicy.Policy.Fixed
+        legend.setSizePolicy(fixed, fixed)         # compact, not stretched to the panel
+        win.addItem(legend, row=row, col=1)
+        curves = []
+        for (key, i, name), colour in zip(panel["curves"], COLOURS * 4):
+            raw = signals[key].columns[i] in SNC_RAW_COLUMNS
+            c = plot.plot(pen=pg.mkPen(colour, width=RAW_LINE_WIDTH if raw else LINE_WIDTH))
+            legend.addItem(pg.PlotDataItem(pen=pg.mkPen(colour, width=3)), name)
+            curves.append((c, key, i, raw))
+        for p, _ in plots.values():               # time labels on the bottom panel only
+            p.getAxis("bottom").setStyle(showValues=False)
+            p.setLabel("bottom", "")
+        if row == max([*plots, row]):
+            plot.setLabel("bottom", "time (s)")
         else:
-            inv = 1.0 / (hi - lo)
-            tr.scale(1.0, inv)
-            tr.translate(0.0, -lo)
-        item.setTransform(tr)
+            plot.getAxis("bottom").setStyle(showValues=False)
+        plots[row] = (plot, curves)
 
-    _identity = QtGui.QTransform()
+    for row, panel in enumerate(panels):
+        if not panel.get("lazy"):                 # default layout: gyro once gyro rows arrive
+            add_panel(row)
 
     def redraw():
-        wb = window_bounds()
-        if wb is None:
+        if reader.latest is None:
             return
-        x_lo, x_hi = wb
-        if x_hi <= x_lo:
-            x_hi = x_lo + 1.0
-
-        for gi, (channels, p) in enumerate(zip(groups, plots)):
-            use_shared = gi in shared
-            group_min = math.inf
-            group_max = -math.inf
-
-            with reader.lock:
-                # Forget samples that have scrolled out of the --width window so
-                # the buffers (and per-frame work) do not grow over time.
-                if width_ms is not None:
-                    for ch in channels:
-                        ch.prune(x_lo)
-
-                if use_shared:
-                    for ch in channels:
-                        lo, hi = _visible_range(ch, x_lo)
-                        if lo is not None:
-                            group_min = min(group_min, lo)
-                            group_max = max(group_max, hi)
-
-                for ch in channels:
-                    n = ch.count
-                    if n == 0:
-                        continue
-                    xs = ch.xs[:n]
-
-                    # Index of the first sample inside the window.
-                    i0 = int(np.searchsorted(xs, x_lo, side="left"))
-                    xw = xs[i0:n]
-                    yw = ch.ys[i0:n]
-
-                    has_left = i0 > 0 and math.isfinite(ch.ys[i0 - 1])
-                    left_hold = ch.ys[i0 - 1] if has_left else math.nan
-
-                    if xw.size == 0 and not has_left:
-                        if draw_line:
-                            ch.curve.setData([], [])
-                        if draw_points and ch.scatter_count != 0:
-                            ch.scatter.clear()
-                            ch.scatter_count = 0
-                        ch.dirty = False
-                        continue
-
-                    # --- LINE: rebuilt every frame (cheap) with real y-values,
-                    # padded so it spans the window edges (hold-flat behavior).
-                    if draw_line:
-                        need_left = has_left and (xw.size == 0 or xw[0] > x_lo)
-                        last_x = xw[-1] if xw.size else x_lo
-                        last_y = yw[-1] if xw.size else left_hold
-                        need_right = math.isfinite(last_y) and last_x < x_hi
-                        if not need_left and not need_right:
-                            xf, yf = xw, yw
-                        else:
-                            px, py = [], []
-                            if need_left:
-                                px.append(np.array((x_lo,)))
-                                py.append(np.array((left_hold,)))
-                            if xw.size:
-                                px.append(xw)
-                                py.append(yw)
-                            if need_right:
-                                px.append(np.array((x_hi,)))
-                                py.append(np.array((last_y,)))
-                            xf = np.concatenate(px)
-                            yf = np.concatenate(py)
-                        ch.curve.setData(xf, yf)
-
-                    # --- SCATTER: real points only, set ONCE per new data (not
-                    # every frame). Scrolling/scaling is handled by the X range
-                    # and the per-channel Y transform below.
-                    if draw_points and ch.count != ch.scatter_count:
-                        pres = ch.present[:n]
-                        if pres.any():
-                            ch.scatter.setData(xs[pres], ch.ys[:n][pres])
-                        else:
-                            ch.scatter.clear()
-                        ch.scatter_count = ch.count
-
-                    # --- per-channel Y scaling via transform (no data rebuild).
-                    if not use_shared:
-                        lo, hi = _visible_range(ch, x_lo)
-                        if lo is None:
-                            if math.isfinite(ch.vmin):
-                                lo, hi = ch.vmin, ch.vmax
-                            else:
-                                continue
-                        if draw_line:
-                            _set_y_transform(ch.curve, lo, hi)
-                        if draw_points:
-                            _set_y_transform(ch.scatter, lo, hi)
-
-                    ch.dirty = False
-
-            # Y range.
-            if use_shared:
-                if math.isfinite(group_min) and math.isfinite(group_max):
-                    lo, hi = group_min, group_max
-                    if hi <= lo:
-                        hi = lo + 1.0
-                    pad = (hi - lo) * 0.05
-                    p.setYRange(lo - pad, hi + pad, padding=0)
-            else:
-                p.setYRange(0.0, 1.0, padding=0.02)
-
-            p.setXRange(x_lo, x_hi, padding=0)
-
-    win.show()
+        for row, panel in enumerate(panels):
+            if row not in plots and signals[panel["curves"][0][0]].chunks:
+                add_panel(row)
+        cache, data = {}, {}
+        for row, (plot, curves) in sorted(plots.items()):
+            data[row] = []
+            for curve, key, i, raw in curves:
+                if key not in cache:
+                    t, v = signals[key].arrays()
+                    x = t - reader.latest
+                    keep = x >= -width
+                    cache[key] = (x[keep], v[keep], connect_mask(x[keep]))
+                x, v, conn = cache[key]
+                # SNC raw: one min / max pair per pixel column (a dense band)
+                bins = max(1, int(plot.getViewBox().width())) if raw else PEAK_BINS
+                xd, yd, cd = peak_decimate(x, v[:, i], conn, bins)
+                if panels[row]["y_range"] is None and row not in shared:
+                    yd = normalize(yd)
+                curve.setData(xd, yd, connect=cd)
+                data[row].append(yd)
+        common = [r for r in sorted(plots) if r in shared and panels[r]["y_range"] is None]
+        if common:                                # --shared-range-groups: one real range
+            rng = y_ranges([data[r] for r in common], set(range(len(common))))[0]
+            if rng is not None:
+                for r in common:
+                    plots[r][0].setYRange(*rng, padding=0.05)
 
     timer = QtCore.QTimer()
     timer.timeout.connect(redraw)
-    timer.start(REDRAW_INTERVAL_MS)
-
-    # Keep the interpreter responsive to SIGINT while inside the Qt loop.
-    sig_timer = QtCore.QTimer()
-    sig_timer.timeout.connect(lambda: None)
-    sig_timer.start(100)
-
-    app.exec_()
-    reader.stop_flag = True
+    timer.start(REDRAW_MS)
+    win.show()
+    return app, win, timer
 
 
-# --------------------------------------------------------------------------
-# main
-# --------------------------------------------------------------------------
-
-def parse_args(argv):
-    ap = argparse.ArgumentParser(
-        description="Fast live viewer for CSV values arriving on stdin.")
-    ap.add_argument("--style", choices=["lines", "points", "linespoints"],
-                    default="linespoints",
-                    help="how to draw each channel (default: linespoints)")
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="live-viewer", description=__doc__.split("\n")[0])
+    ap.add_argument("--width", type=parse_duration, default=5.0,
+                    help="time window shown, e.g. 500ms, 5s, 2m (default 5s)")
     ap.add_argument("--group", action="append", default=[],
-                    help="define a plot group; may be given multiple times. "
-                         "A group is either a set of 1-based column "
-                         "numbers/ranges (e.g. '4-9' or '1,3,5'), a wildcard "
-                         "matching header column names (e.g. 'snc*', 'a*'), or "
-                         "a channel token (e.g. 'imu') selecting rows by their "
-                         "channel column.")
+                    help="one panel per --group, as upstream: 1-based column numbers / "
+                         "ranges ('4-9', '1,3,5'), a wildcard on the column names "
+                         "('snc*', 'a*') or a channel token selecting rows by their "
+                         "stream column ('imu'); each line scaled to 0-1 unless shared. "
+                         "Without --group: the "
+                         "four fixed panels.")
     ap.add_argument("--shared-range-groups", default="",
-                    help="comma-separated 1-based indices of groups (top to "
-                         "bottom) that should share a common min/max across all "
-                         "their channels, e.g. '1,3,4'.")
-    ap.add_argument("--width", type=parse_duration, default=None,
-                    help="width of the rolling time window to display; older "
-                         "data is rolled out. Accepts e.g. 500ms, 3s, 2m, 1h. "
-                         "If given multiple times only the last is used. "
-                         "Without it, the full history is shown.")
-    ap.add_argument("--realtime-replay", action="store_true",
-                    help="pace stdin according to its own timestamp column "
-                         "instead of consuming it as fast as possible: the "
-                         "first timestamp seen is anchored to the current "
-                         "wall-clock time, and later lines are held back so "
-                         "they are dispatched only once that much real time "
-                         "has elapsed. Useful for replaying a recorded CSV "
-                         "as if it were arriving live.")
-    return ap.parse_args(argv)
-
-
-def read_sample(nrows=400):
-    """Read the header (if any) plus some sample rows for structure guessing,
-    without losing them from the stream."""
-    lines = []
-    for _ in range(nrows):
-        line = sys.stdin.readline()
-        if not line:
-            break
-        lines.append(line.rstrip("\n").rstrip("\r"))
-    return lines
-
-
-class PrereadStdin:
-    """Iterable yielding pre-read sample lines first, then the live stream."""
-    def __init__(self, buffered_lines, real):
-        self._buf = buffered_lines
-        self._real = real
-
-    def __iter__(self):
-        for l in self._buf:
-            yield l
-        for l in self._real:
-            yield l
-
-
-def main():
-    args = parse_args(sys.argv[1:])
-
-    sample_lines = read_sample()
-    if not sample_lines:
-        sys.stderr.write("live-viewer: no input on stdin\n")
-        return 1
-
-    split_rows = [l.split(",") for l in sample_lines]
-
-    header = None
-    data_lines = sample_lines
-    data_rows = split_rows
-    if is_header_row(split_rows[0]):
-        header = [h.strip() for h in split_rows[0]]
-        data_rows = split_rows[1:]
-        data_lines = sample_lines[1:]
-
-    st = guess_structure(header, data_rows)
-    sys.stderr.write(st.describe() + "\n")
-    if st.ts_col is not None:
-        sys.stderr.write("Timestamp column: %d (%s)\n" %
-                         (st.ts_col + 1, "ISO" if st.ts_is_iso else "numeric"))
-    sys.stderr.flush()
-
-    specs = [GroupSpec(g) for g in args.group]
-    groups, titles, plan = build_groups(st, specs, data_rows)
-
-    shared = []
-    if args.shared_range_groups.strip():
-        for tok in args.shared_range_groups.split(","):
-            tok = tok.strip()
-            if tok.isdigit():
-                shared.append(int(tok) - 1)  # 1-based -> 0-based
-
-    # Reader replays the buffered DATA lines first, then the live stdin.
-    line_source = PrereadStdin(list(data_lines), sys.stdin)
-    reader = Reader(st, plan, line_source, realtime_replay=args.realtime_replay)
+                    help="comma-separated 1-based indices of --group panels that share "
+                         "one y range, e.g. '1,2,3'")
+    args = ap.parse_args(argv)
+    header = sys.stdin.readline().rstrip("\r\n").split(",")
+    stream = sys.stdin
+    if args.group:                             # as upstream: sample rows read ahead, then replayed
+        sample = [sys.stdin.readline() for _ in range(SAMPLE_LINES - 1)]
+        sample = [ln for ln in sample if ln]
+        stream = itertools.chain(sample, sys.stdin)
+        rows = [ln.rstrip("\r\n").split(",") for ln in sample]
+        signals, panels = group_layout(header, args.group, args.width + 1.0, rows)
+        shared = shared_groups(args.shared_range_groups, len(panels))
+    else:
+        signals, panels, shared = make_signals(args.width + 1.0), default_panels(), set()
+    reader = Reader(stream, header, signals)
     reader.start()
-
-    run_gui(st, groups, titles, reader, shared, args.style, args.width)
-    reader.stop_flag = True
-    return 0
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+    app, _win, _timer = run_gui(reader, signals, args.width, panels, shared)
+    app.exec()
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
