@@ -15,7 +15,8 @@ Created by Ondřej Bojar and Claude Opus 4.8 based on the [Prodilink](https://gi
 - Single CLI tool with four commands: `scan`, `info`, `stream-csv`, `stream-lsl`.
 - Records the band's raw channels as **real decoded float values**: the three
   **SNC** (sEMG) nerve channels with per-packet **RMS**, and the **IMU**
-  accelerometer (raw gyroscope bytes available on request).
+  accelerometer and, on firmware 6.0.9.10, gyroscope (elsewhere raw gyroscope
+  bytes are available on request).
 - Output is primarily decoded floats; the verbatim packet bytes are added only
   with `--include-raw-bytes`.
 - Exact global timestamps to the nanosecond (`time.time_ns()` captured at BLE
@@ -235,7 +236,9 @@ CSV contains only decoded values).
 
 Accelerometer and gyroscope are delivered together in a single IMU packet, so
 the IMU stream is only disabled — freeing BLE bandwidth for the remaining
-channels — when **both** `--skip-acc` and `--skip-gyro` are given.
+channels — when **both** `--skip-acc` and `--skip-gyro` are given. On firmware
+6.0.9.10 acc and gyro are separate records (see below), so a stream that is
+not enabled sends nothing.
 
 ## Output formats
 
@@ -246,18 +249,23 @@ sample. Columns (the `raw_hex` column is present only with
 `--include-raw-bytes`):
 
 ```
-timestamp_ns, timestamp_iso, stream, [raw_hex,] snc1, snc2, snc3, rms1, rms2, rms3, ax, ay, az
+timestamp_ns, timestamp_iso, stream, [raw_hex,] snc1, snc2, snc3, rms1, rms2, rms3, ax, ay, az,
+gx, gy, gz, device_ts
 ```
 
 - `timestamp_ns` — global wall-clock time in nanoseconds since the Unix epoch,
   captured when the BLE packet arrived.
 - `timestamp_iso` — the same instant as ISO-8601 UTC with nanosecond precision.
-- `stream` — `snc` or `imu`.
+- `stream` — `snc`, `imu` or `gyro`.
 - `raw_hex` — (only with `--include-raw-bytes`) the verbatim BLE payload.
 - `snc1, snc2, snc3` — the three sEMG nerve channels (filled only on `snc`
   rows). A clipped / no-contact sample is written as `nan`.
 - `rms1, rms2, rms3` — per-packet RMS of each SNC channel (see below).
 - `ax, ay, az` — decoded int16 accelerometer axes (filled only on `imu` rows).
+- `gx, gy, gz` — decoded int16 gyroscope axes (filled only on `gyro` rows;
+  firmware 6.0.9.10 only).
+- `device_ts` — the IMU record's raw u32 device timestamp, shared by its 8
+  samples (firmware 6.0.9.10 only; wraps at 2^32).
 
 Columns not relevant to a given row's `stream` are left empty.
 
@@ -272,13 +280,15 @@ CSV when you use `-o -`.
 
 ### LSL
 
-Up to two outlets are created as data arrives:
+Up to three outlets are created as data arrives:
 
 - `Mudra-SNC` — type `EMG`, six `float32` channels labelled
   `snc1, snc2, snc3, rms1, rms2, rms3` (the three nerve signals plus their
   per-packet RMS).
 - `Mudra-IMU` — type `Motion`, three `float32` channels labelled `ax, ay, az`
-  (accelerometer). Gyroscope is not published over LSL.
+  (accelerometer).
+- `Mudra-Gyro` — type `Motion`, three `float32` channels labelled `gx, gy, gz`
+  (gyroscope; firmware 6.0.9.10 only).
 
 Each sample is pushed with its exact wall-clock timestamp (converted to LSL
 seconds), and channel labels are written into the stream metadata so MNE-Python
@@ -315,12 +325,29 @@ packet bytes preserved alongside the decoded values.
   accelerometer samples as int16 little-endian `(ax, ay, az)` triplets; these
   decode cleanly and reproducibly and are emitted in the `ax/ay/az` columns.
 
-- **Gyroscope is not decoded.** The same IMU packet also carries a gyroscope
-  block whose byte layout is not reliably understood, so `mudrarecord` does not
-  turn it into columns. Its raw bytes are available via `--include-raw-bytes`.
-  Because acc and gyro share one packet, they cannot be recorded independently;
-  the IMU stream is only fully disabled when both `--skip-acc` and `--skip-gyro`
-  are set.
+- **Gyroscope is not decoded on firmware 6.0.11.5.** The same IMU packet also
+  carries a gyroscope block whose byte layout is not reliably understood, so
+  `mudrarecord` does not turn it into columns there. Its raw bytes are
+  available via `--include-raw-bytes`. Because acc and gyro share one packet,
+  they cannot be recorded independently; the IMU stream is only fully
+  disabled when both `--skip-acc` and `--skip-gyro` are set.
+
+- **IMU record layout on firmware 6.0.9.10.** There a 106-byte IMU
+  notification is two 53-byte records,
+  `[tag u8][8 x (x, y, z) int16 LE][u32 LE device timestamp]`, tag `0x0a` =
+  accelerometer and `0x04` = gyroscope. With both streams on, the band sends
+  acc(t) gyro(t) acc(t') gyro(t') ..., and a packet may start with either
+  record, so pair acc and gyro by `device_ts`, not by packet. mudrarecord
+  picks this layout from the firmware version read at connect; any other
+  firmware uses the decoder above. `--imu-layout records` forces the record
+  decoder on any firmware (records with an unknown tag are skipped with a
+  warning on stderr), `--imu-layout legacy` the decoder above. To compare
+  both decoders on a recording made with `--include-raw-bytes`:
+  `python evidence/compare_decoders.py evidence/still_5s.csv` (5 s of a
+  band lying still, firmware 6.0.9.10). Values are raw LSB; the nominal
+  sensitivities are 16384 LSB/g (±2 g) and 131.072 LSB/(°/s) (±250 °/s);
+  ordinary hand motion can reach the ±250 °/s gyro range. The unit this was
+  measured on differed from the nominal gyro scale by up to 1.7 % per axis.
 
 - **No firmware "sample rate" knob.** The device pushes BLE notifications at its
   own native (maximum) rate; there is no documented command to set a target Hz.
@@ -351,7 +378,8 @@ packet bytes preserved alongside the decoded values.
 
 ```
 mudrarecord/
-  protocol.py   - BLE UUIDs, status indices, raw IMU/SNC decoders
+  protocol.py   - BLE UUIDs, status indices, raw IMU/SNC decoders,
+                  IMU record parser (firmware 6.0.9.10)
   commands.py   - firmware command byte builders (channels, HID, sample type)
   ble.py        - BLE connection; timestamps notifications at arrival
   status.py     - firmware status parser (info + verification)

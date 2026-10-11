@@ -88,6 +88,7 @@ def test_csv_sink_header_and_imu_row(tmp_path):
     assert lines[0].split(",") == [
         "timestamp_ns", "timestamp_iso", "stream",
         "snc1", "snc2", "snc3", "rms1", "rms2", "rms3", "ax", "ay", "az",
+        "gx", "gy", "gz", "device_ts",
     ]
     row = lines[1].split(",")
     assert row[0] == "42"
@@ -95,6 +96,7 @@ def test_csv_sink_header_and_imu_row(tmp_path):
     # No raw_hex column by default.
     assert row[3:9] == ["", "", "", "", "", ""]  # snc + rms empty
     assert row[9:12] == ["1", "2", "3"]          # ax, ay, az
+    assert row[12:] == ["", "", "", ""]          # gyro + device_ts empty
     assert sink.count == 1
 
 
@@ -108,7 +110,7 @@ def test_csv_sink_snc_row(tmp_path):
     assert row[2] == "snc"
     assert row[3:6] == ["471.0", "12.0", "-3.0"]   # snc1..3
     assert row[6:9] == ["100.0", "5.0", "2.0"]     # rms1..3
-    assert row[9:] == ["", "", ""]                 # imu columns empty
+    assert row[9:] == [""] * 7                     # imu, gyro, device_ts empty
 
 
 def test_csv_sink_include_raw_bytes(tmp_path):

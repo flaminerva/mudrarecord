@@ -21,8 +21,13 @@ Decoded channel layout per stream (fixed so CSV columns are stable):
   RMS of each channel ``rms1, rms2, rms3``. One BLE packet contains a batch of
   samples; the packet is linearized into one row per sample, and the packet's
   RMS triple is repeated on every row of that packet.
-* ``imu``: the accelerometer axes ``ax, ay, az`` (int16). The gyroscope portion
-  of the IMU packet is not decoded; enable ``include_raw`` to keep its bytes.
+* ``imu``: the accelerometer axes ``ax, ay, az`` (int16).
+* ``gyro``: the gyroscope axes ``gx, gy, gz`` (int16, raw LSB). Only with the
+  IMU record layout (firmware 6.0.9.10); the legacy layout does not decode the
+  gyroscope (enable ``include_raw`` to keep its bytes).
+
+With the record layout, ``imu`` and ``gyro`` rows also carry ``device_ts``,
+the record's raw u32 device timestamp (shared by its 8 samples; it wraps).
 """
 from __future__ import annotations
 
@@ -37,10 +42,14 @@ from . import protocol
 SNC_COLUMNS = ["snc1", "snc2", "snc3", "rms1", "rms2", "rms3"]
 IMU_COLUMNS = ["ax", "ay", "az"]
 VALUE_COLUMNS = SNC_COLUMNS + IMU_COLUMNS
+# Appended after VALUE_COLUMNS, so existing column positions do not change.
+GYRO_COLUMNS = ["gx", "gy", "gz"]
+ALL_VALUE_COLUMNS = VALUE_COLUMNS + GYRO_COLUMNS + ["device_ts"]
 
 # LSL channel layouts.
 SNC_LSL_CHANNELS = 6  # snc1, snc2, snc3, rms1, rms2, rms3
 IMU_LSL_CHANNELS = 3  # ax, ay, az
+GYRO_LSL_CHANNELS = 3  # gx, gy, gz
 
 
 def _iso_ns(ts_ns: int) -> str:
@@ -83,15 +92,16 @@ class CSVSink:
     Columns (raw_hex only present when ``include_raw`` is set)::
 
         timestamp_ns, timestamp_iso, stream, [raw_hex,]
-        snc1, snc2, snc3, rms1, rms2, rms3, ax, ay, az
+        snc1, snc2, snc3, rms1, rms2, rms3, ax, ay, az, gx, gy, gz, device_ts
 
-    Each row fills only the columns relevant to its ``stream`` (``snc`` or
-    ``imu``); the others are left empty.
+    Each row fills only the columns relevant to its ``stream`` (``snc``,
+    ``imu`` or ``gyro``); the others are left empty.
     """
 
     _STREAM_COLUMNS = {
         "snc": SNC_COLUMNS,
         "imu": IMU_COLUMNS,
+        "gyro": GYRO_COLUMNS,
     }
 
     def __init__(
@@ -104,7 +114,7 @@ class CSVSink:
         self._owns_fh = False
         self._since_flush = 0
         self.count = 0
-        self._col_index = {c: i for i, c in enumerate(VALUE_COLUMNS)}
+        self._col_index = {c: i for i, c in enumerate(ALL_VALUE_COLUMNS)}
 
     def open(self) -> None:
         if self._path in (None, "-"):
@@ -118,14 +128,17 @@ class CSVSink:
         header = ["timestamp_ns", "timestamp_iso", "stream"]
         if self._include_raw:
             header.append("raw_hex")
-        header += VALUE_COLUMNS
+        header += ALL_VALUE_COLUMNS
         self._fh.write(",".join(header) + "\n")
 
-    def write(self, stream: str, ts_ns: int, raw: bytes, channels: list) -> None:
+    def write(self, stream: str, ts_ns: int, raw: bytes, channels: list,
+              device_ts: Optional[int] = None) -> None:
         assert self._fh is not None
-        values = [""] * len(VALUE_COLUMNS)
+        values = [""] * len(ALL_VALUE_COLUMNS)
         for col, val in zip(self._STREAM_COLUMNS.get(stream, []), channels):
             values[self._col_index[col]] = _fmt(val)
+        if device_ts is not None:
+            values[self._col_index["device_ts"]] = str(device_ts)
         row = [str(ts_ns), _iso_ns(ts_ns), stream]
         if self._include_raw:
             row.append(raw.hex())
@@ -157,6 +170,8 @@ class LSLSink:
     * ``Mudra-SNC`` (type ``EMG``): 6 channels ``snc1, snc2, snc3, rms1, rms2,
       rms3``. The three sEMG signals plus the per-packet RMS of each channel.
     * ``Mudra-IMU`` (type ``Motion``): 3 channels ``ax, ay, az`` (accelerometer).
+    * ``Mudra-Gyro`` (type ``Motion``): 3 channels ``gx, gy, gz`` (gyroscope),
+      only with the IMU record layout.
 
     All channels use the ``float32`` LSL format. Nominal sampling rate is
     advertised as irregular because the device streams at its own (variable)
@@ -191,6 +206,8 @@ class LSLSink:
 
         if stream == "snc":
             name, stype, labels = "Mudra-SNC", "EMG", list(SNC_COLUMNS)
+        elif stream == "gyro":
+            name, stype, labels = "Mudra-Gyro", "Motion", list(GYRO_COLUMNS)
         else:
             name, stype, labels = "Mudra-IMU", "Motion", list(IMU_COLUMNS)
 
@@ -212,8 +229,12 @@ class LSLSink:
         self._outlets[stream] = outlet
         return outlet
 
-    def write(self, stream: str, ts_ns: int, raw: bytes, channels: list) -> None:
-        n = SNC_LSL_CHANNELS if stream == "snc" else IMU_LSL_CHANNELS
+    _CHANNELS = {"snc": SNC_LSL_CHANNELS, "imu": IMU_LSL_CHANNELS, "gyro": GYRO_LSL_CHANNELS}
+
+    def write(self, stream: str, ts_ns: int, raw: bytes, channels: list,
+              device_ts: Optional[int] = None) -> None:
+        # device_ts is CSV-only; LSL uses the host arrival time.
+        n = self._CHANNELS.get(stream, IMU_LSL_CHANNELS)
         sample = [float(c) for c in channels[:n]]
         sample += [0.0] * (n - len(sample))
         outlet = self._get_outlet(stream, n)
@@ -240,3 +261,25 @@ def decode_samples(stream: str, raw: bytes) -> list[list]:
         rms = protocol.snc_packet_rms(raw)
         return [row + rms for row in rows]
     return [list(row) for row in protocol.decode_imu_packet(raw)]
+
+
+def decode_imu(raw: bytes, layout: str,
+               unknown: Optional[list] = None) -> list[tuple[str, list, Optional[int]]]:
+    """Decode one IMU notification into ``(stream, channels, device_ts)`` rows.
+
+    * legacy layout: the rows of ``decode_samples("imu", raw)``, device_ts None.
+    * record layout: acc records -> ``imu`` rows, gyro records -> ``gyro`` rows,
+      8 rows per record with the record's raw device timestamp; records with an
+      unknown tag are skipped (their tag bytes are appended to ``unknown``).
+    """
+    if layout == protocol.IMU_LAYOUT_LEGACY:
+        return [("imu", list(r), None) for r in protocol.decode_imu_packet(raw)]
+    rows: list[tuple[str, list, Optional[int]]] = []
+    for rec in protocol.split_imu_records(raw):
+        if rec.kind == "unknown":
+            if unknown is not None:
+                unknown.append(rec.tag)
+            continue
+        stream = "imu" if rec.kind == "acc" else "gyro"
+        rows += [(stream, list(sample), rec.device_ts) for sample in rec.samples]
+    return rows

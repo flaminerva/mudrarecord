@@ -23,6 +23,9 @@ mudrarecord always keeps the verbatim raw bytes alongside the decoded values):
   packet always carries both acc and gyro regardless of which enable commands
   were sent.
 
+  On firmware 6.0.9.10 the IMU notification is two 53-byte acc / gyro records
+  instead (see "IMU record layout" below).
+
 * SNC characteristic (``0000fff4``), 112 bytes = 56 int16 LE:
       indices 0..53  : 18 samples, 3 channels interleaved (snc1, snc2, snc3)
       indices 54..55 : 2-value footer (not sensor data)
@@ -34,7 +37,8 @@ mudrarecord always keeps the verbatim raw bytes alongside the decoded values):
 from __future__ import annotations
 
 import struct
-from typing import List
+from dataclasses import dataclass
+from typing import List, Tuple
 
 
 class Characteristic:
@@ -141,6 +145,61 @@ def decode_imu_packet(data: bytes) -> List[tuple[int, int, int]]:
     for non-0x04 / short packets.
     """
     return [tuple(s) for s in decode_acc_samples(data)]
+
+
+# --- IMU record layout (firmware 6.0.9.10) -----------------------------------
+#
+# A 106-byte IMU notification is two records of a continuous record stream:
+#
+#   record = [tag u8][8 samples x (x, y, z) int16 LE][u32 LE device timestamp]
+#   tag 0x0a = accelerometer, 0x04 = gyroscope
+#
+# With both streams on the device sends acc(t) gyro(t) acc(t') gyro(t') ...;
+# a packet may start with either, so pair acc and gyro by timestamp, not by
+# packet. The device timestamp is a raw u32 tick counter that wraps.
+
+IMU_LAYOUT_RECORDS = "records"
+IMU_LAYOUT_LEGACY = "legacy"
+IMU_RECORD_LAYOUT_FIRMWARE = frozenset({"6.0.9.10"})
+
+IMU_RECORD_SIZE = 53
+IMU_RECORD_SAMPLES = 8
+IMU_RECORD_TS_OFFSET = 49
+IMU_RECORD_KINDS = {0x0A: "acc", 0x04: "gyro"}
+
+
+@dataclass(frozen=True)
+class ImuRecord:
+    kind: str                              # "acc", "gyro" or "unknown"
+    tag: int
+    device_ts: int                         # raw u32 device timestamp
+    samples: Tuple[Tuple[int, int, int], ...]
+
+
+def imu_layout_for_firmware(firmware_version: str) -> str:
+    """Record layout on firmware where it was verified, else the legacy one."""
+    fw = firmware_version.strip("\x00 \t\r\n")
+    return IMU_LAYOUT_RECORDS if fw in IMU_RECORD_LAYOUT_FIRMWARE else IMU_LAYOUT_LEGACY
+
+
+def resolve_imu_layout(requested: str, firmware_version: str) -> str:
+    """``--imu-layout``: "auto" picks by firmware, "records" / "legacy" force one."""
+    return imu_layout_for_firmware(firmware_version) if requested == "auto" else requested
+
+
+def split_imu_records(data: bytes) -> List[ImuRecord]:
+    """Split an IMU notification into 53-byte records ([] if the length is
+    not a positive multiple of 53). Unknown tags give ``kind == "unknown"``."""
+    if not data or len(data) % IMU_RECORD_SIZE:
+        return []
+    out: list[ImuRecord] = []
+    for off in range(0, len(data), IMU_RECORD_SIZE):
+        tag = data[off]
+        flat = struct.unpack_from("<%dh" % (3 * IMU_RECORD_SAMPLES), data, off + 1)
+        samples = tuple(tuple(flat[i:i + 3]) for i in range(0, len(flat), 3))
+        ts = struct.unpack_from("<I", data, off + IMU_RECORD_TS_OFFSET)[0]
+        out.append(ImuRecord(IMU_RECORD_KINDS.get(tag, "unknown"), tag, ts, samples))
+    return out
 
 
 # --- SNC (sEMG) decode -----------------------------------------------------

@@ -17,7 +17,8 @@ import asyncio
 import sys
 
 from . import __version__
-from .recorder import CSVSink, Decimator, LSLSink, decode_samples
+from .protocol import resolve_imu_layout
+from .recorder import CSVSink, Decimator, LSLSink, decode_imu, decode_samples
 
 
 # --------------------------------------------------------------------------
@@ -66,6 +67,12 @@ def main() -> None:
             "--skip-gyro", action="store_true",
             help="Do not record gyroscope (gyro is never decoded into columns; "
             "see --skip-acc note about the shared IMU packet).",
+        )
+        p.add_argument(
+            "--imu-layout", choices=["auto", "records", "legacy"], default="auto",
+            help="IMU packet decoder: 'records' (two 53-byte acc / gyro records, "
+            "verified on firmware 6.0.9.10), 'legacy' (original decoder) or "
+            "'auto' (records on 6.0.9.10, legacy otherwise; default).",
         )
         p.add_argument(
             "--restore-hid",
@@ -226,6 +233,9 @@ async def _cmd_stream(args, mode: str) -> None:
     await device.refresh_status()
     await asyncio.sleep(0.3)
 
+    # IMU packet layout: 53-byte acc / gyro records on verified firmware.
+    imu_layout = resolve_imu_layout(args.imu_layout, device.firmware_version or "")
+
     # Build the sink.
     if mode == "csv":
         sink = CSVSink(args.output, include_raw=args.include_raw_bytes)
@@ -246,8 +256,16 @@ async def _cmd_stream(args, mode: str) -> None:
         if not decimator.accept(stream):
             return
         try:
-            for channels in decode_samples(stream, raw):
-                sink.write(stream, ts_ns, raw, channels)
+            if stream == "imu":
+                unknown: list = []
+                for row_stream, channels, device_ts in decode_imu(raw, imu_layout, unknown):
+                    sink.write(row_stream, ts_ns, raw, channels, device_ts=device_ts)
+                for tag in unknown:
+                    print(f"Warning: IMU record with unknown tag 0x{tag:02x} skipped "
+                          "(check --imu-layout).", file=sys.stderr)
+            else:
+                for channels in decode_samples(stream, raw):
+                    sink.write(stream, ts_ns, raw, channels)
         except OSError as e:
             # e.g. ENOSPC (disk full). Stop cleanly.
             disk_full["flag"] = True
