@@ -26,8 +26,8 @@ def _row(t_ms, stream, values, device_ts=None):
     return ",".join([str(int(t_ms * 1e6)), "", stream] + cells) + "\n"
 
 
-def _read(lines):
-    signals = lv.make_signals(100.0)
+def _read(lines, rms_packets=lv.RMS_PACKETS):
+    signals = lv.make_signals(100.0, rms_packets)
     r = lv.Reader(io.StringIO("".join(lines)), HEADER, signals)
     r.run()
     return r, signals
@@ -67,6 +67,30 @@ def test_rms_one_point_per_packet_moving_rms_of_6_packets():
     want = [np.sqrt(np.mean(np.square(rms[max(0, p - 5):p + 1]))) for p in range(8)]
     assert np.allclose(v[:, 0], want)                          # RMS over the last 6
     assert np.allclose(v[:, 1], 5) and np.isnan(v[:, 2]).all()
+
+
+@pytest.mark.parametrize("n", [1, 3])
+def test_rms_packets_sets_the_moving_rms_window(n):
+    rms = [3.0, 4.0, 0.0, 0.0, 0.0, 0.0, 0.0, 12.0]
+    lines = [_row(10 * p, "snc", [1, 2, 3, r, 5, float("nan")])
+             for p, r in enumerate(rms) for _ in range(18)]
+    _, s = _read(lines, rms_packets=n)
+    t, v = s["snc"].arrays()
+    assert np.allclose(t, 0.01 * np.arange(8))                 # one point per packet
+    want = [np.sqrt(np.mean(np.square(rms[max(0, p - n + 1):p + 1]))) for p in range(8)]
+    assert np.allclose(v[:, 0], want)                          # RMS over the last n
+    if n == 1:
+        assert v[:, 0].tolist() == rms                         # each packet's value
+    assert np.allclose(v[:, 1], 5) and np.isnan(v[:, 2]).all()
+
+
+@pytest.mark.parametrize("argv", [["--rms-packets", "0"], ["--rms-packets", "-1"],
+                                  ["--rms-packets", "1.5"],
+                                  ["--rms-packets", "1", "--group", "snc*"],
+                                  ["--rms-packets", "6", "--group", "snc*"]])
+def test_rms_packets_rejected(argv):
+    with pytest.raises(SystemExit):
+        lv.main(argv)
 
 
 def _imu_on_device_clock(ts_list, arrival_ms):

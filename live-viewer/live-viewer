@@ -2,6 +2,7 @@
 """live-viewer: live plot of a mudrarecord CSV stream read from stdin.
 
     mudrarecord stream-csv | live-viewer --width=5s
+    mudrarecord stream-csv | live-viewer --width=5s --rms-packets=1
     mudrarecord stream-csv | live-viewer --width=5s --group='snc*' \
         --group='rms*' --group='a*' --shared-range-groups=1,2,3
 
@@ -18,7 +19,8 @@ whose stream column is imu, with the columns that carry data in such rows
 among the first 400 lines); raw CSV values. As upstream, each line of a
 panel is scaled separately to 0-1 of the panel (y numbers hidden), except in
 --shared-range-groups panels, which share one real range. Placement, gap breaks and min / max drawing are the same as below;
-the SNC RMS smoothing applies to the four-panel layout only.
+the SNC RMS smoothing (and --rms-packets) applies to the four-panel layout
+only.
 
 mudrarecord writes railed SNC samples (-32768 / +32767) as nan; when the CSV
 has a raw_hex column the viewer reads their value from it, so railing is
@@ -38,7 +40,8 @@ device_ts: the 8 samples of a record evenly over the device-time interval
 since the previous record (the timestamp is the last sample), mapped to host
 time by a running linear fit of arrival time against device time; without
 device_ts they are placed like SNC. SNC RMS shows the RMS over the last
-RMS_PACKETS packets' rms1-3 (display only), one point per packet.
+--rms-packets packets' rms1-3 (display only; default RMS_PACKETS, 1 draws
+each packet's values as upstream), one point per packet.
 Consecutive samples more than 2x the median sample interval apart are not
 connected.
 """
@@ -142,13 +145,13 @@ class Signal:
     """Samples of some CSV columns, (time, values), placed packet by packet
     (SNC) or record by record (acc / gyro on the device clock)."""
 
-    def __init__(self, columns, scale, per_packet, keep_s, clock=None, smooth=False,
+    def __init__(self, columns, scale, per_packet, keep_s, clock=None, smooth=0,
                  stream=None):
         self.columns = tuple(columns)
         self.stream = stream                       # only rows whose stream column equals this
         self.scale, self.per_packet, self.keep_s = scale, per_packet, keep_s
         self.clock = clock                         # set: acc / gyro, device_ts used if present
-        self.smooth = smooth                       # SNC RMS panel: RMS over RMS_PACKETS packets
+        self.smooth = smooth                       # SNC RMS panel: RMS over this many packets
         self.chunks = collections.deque()          # (times (n,), values (n, k), on device clock)
         self._group_key = None
         self._group_t = None
@@ -156,7 +159,7 @@ class Signal:
         self._group = []
         self._last = None
         self._intervals = collections.deque(maxlen=INTERVAL_HISTORY)
-        self._recent = collections.deque(maxlen=RMS_PACKETS)
+        self._recent = collections.deque(maxlen=smooth or 1)
         self.lock = threading.Lock()
 
     def add(self, t, values, dev=None):
@@ -219,11 +222,12 @@ class Signal:
         return t, np.concatenate([c[1] for c in chunks])
 
 
-def make_signals(keep_s):
+def make_signals(keep_s, rms_packets=RMS_PACKETS):
     """Default layout: one Signal per panel; acc and gyro share one device clock."""
     clock = DeviceClock()
     return {key: Signal(cols, scale, per_packet, keep_s,
-                        clock if key in ("acc", "gyro") else None, smooth=key == "snc")
+                        clock if key in ("acc", "gyro") else None,
+                        smooth=rms_packets if key == "snc" else 0)
             for key, _, cols, scale, per_packet in PANELS}
 
 
@@ -540,7 +544,17 @@ def main(argv=None):
     ap.add_argument("--shared-range-groups", default="",
                     help="comma-separated 1-based indices of --group panels that share "
                          "one y range, e.g. '1,2,3'")
+    ap.add_argument("--rms-packets", type=int, default=None, metavar="N",
+                    help="SNC RMS panel: RMS over the last N packets' rms1-3 "
+                         f"(default {RMS_PACKETS}, ~100 ms); 1 draws each packet's "
+                         "values as upstream. Not with --group.")
     args = ap.parse_args(argv)
+    if args.rms_packets is not None and args.group:
+        ap.error("--rms-packets applies to the four-panel layout only, not with --group")
+    if args.rms_packets is None:
+        args.rms_packets = RMS_PACKETS
+    if args.rms_packets < 1:
+        ap.error("--rms-packets must be an integer >= 1")
     header = sys.stdin.readline().rstrip("\r\n").split(",")
     stream = sys.stdin
     if args.group:                             # as upstream: sample rows read ahead, then replayed
@@ -551,7 +565,8 @@ def main(argv=None):
         signals, panels = group_layout(header, args.group, args.width + 1.0, rows)
         shared = shared_groups(args.shared_range_groups, len(panels))
     else:
-        signals, panels, shared = make_signals(args.width + 1.0), default_panels(), set()
+        signals = make_signals(args.width + 1.0, args.rms_packets)
+        panels, shared = default_panels(), set()
     reader = Reader(stream, header, signals)
     reader.start()
     signal.signal(signal.SIGINT, signal.SIG_DFL)
