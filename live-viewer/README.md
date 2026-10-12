@@ -4,11 +4,11 @@ Live plot of a `mudrarecord stream-csv` stream read from stdin:
 
 Panels: SNC raw (-32768..32767), SNC RMS (0..32768), acc (±2 g), gyro
 (±250 deg/s), fixed y axes, on one time axis in seconds before the newest
-row. `--width` sets the time window (default 5s). SNC RMS is smoothed over
-the last 6 packets (~100 ms); `--rms-packets 1` draws each packet's values
-as upstream, `--rms-packets N` sets the window:
+row. `--width` sets the time window (default 5s). SNC RMS shows each
+packet's values, as upstream; `--rms-packets N` smooths it to the RMS over
+the last N packets (6 is ~100 ms):
 
-    mudrarecord stream-csv | live-viewer/live-viewer --width=5s --rms-packets 1
+    mudrarecord stream-csv | live-viewer/live-viewer --width=5s --rms-packets 6
 
 Upstream's options also work: one panel per `--group` (column numbers like
 `4-9`, a pattern on the column names like `a*`, or a channel token like

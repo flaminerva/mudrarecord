@@ -68,11 +68,11 @@ samples evenly over the time since the previous packet. acc / gyro samples
 go on the device clock when `device_ts` is present (8 per record, evenly over
 the record's device-time interval, mapped to host time by a running linear
 fit of arrival against device time), else they are spread like SNC. SNC RMS
-is shown as the RMS over the last 6 packets (display only; `--rms-packets 1`
-draws each packet's values as upstream, `--rms-packets N` sets the window).
-Each signal is plotted only where it has values, and a line breaks where two
-samples are more than twice the usual interval apart (so lost IMU records
-show as short gaps). SNC raw is drawn as the min / max per pixel column, the
+shows each packet's values, as upstream; `--rms-packets N` shows the RMS over
+the last N packets instead (display only, e.g. 6 for ~100 ms). Each signal
+is plotted only where it has values, and a line breaks where two samples are
+more than twice the usual interval apart (so lost IMU records show as short
+gaps). SNC raw is drawn as the min / max per pixel column, the
 other lines as the min / max of a few hundred bins (peaks and railing stay
 visible), without antialiasing, so the viewer keeps up with a live session.
 

@@ -57,11 +57,23 @@ def test_after_a_gap_the_median_interval_is_used():
     assert not conn[-9] and conn[-8:-1].all()   # broken only across the gap
 
 
+def test_rms_default_is_each_packets_value_as_upstream():
+    rms = [3.0, 4.0, 0.0, 0.0, 0.0, 0.0, 0.0, 12.0]
+    lines = [_row(10 * p, "snc", [1, 2, 3, r, 5, float("nan")])
+             for p, r in enumerate(rms) for _ in range(18)]
+    s = lv.make_signals(100.0)
+    lv.Reader(io.StringIO("".join(lines)), HEADER, s).run()
+    t, v = s["snc"].arrays()
+    assert np.allclose(t, 0.01 * np.arange(8))                 # one point per packet
+    assert v[:, 0].tolist() == rms                             # unsmoothed
+    assert np.allclose(v[:, 1], 5) and np.isnan(v[:, 2]).all()
+
+
 def test_rms_one_point_per_packet_moving_rms_of_6_packets():
     rms = [3.0, 4.0, 0.0, 0.0, 0.0, 0.0, 0.0, 12.0]
     lines = [_row(10 * p, "snc", [1, 2, 3, r, 5, float("nan")])
              for p, r in enumerate(rms) for _ in range(18)]
-    _, s = _read(lines)
+    _, s = _read(lines, rms_packets=6)
     t, v = s["snc"].arrays()
     assert np.allclose(t, 0.01 * np.arange(8))                 # one point per packet
     want = [np.sqrt(np.mean(np.square(rms[max(0, p - 5):p + 1]))) for p in range(8)]

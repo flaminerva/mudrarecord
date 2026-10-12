@@ -2,7 +2,7 @@
 """live-viewer: live plot of a mudrarecord CSV stream read from stdin.
 
     mudrarecord stream-csv | live-viewer --width=5s
-    mudrarecord stream-csv | live-viewer --width=5s --rms-packets=1
+    mudrarecord stream-csv | live-viewer --width=5s --rms-packets=6
     mudrarecord stream-csv | live-viewer --width=5s --group='snc*' \
         --group='rms*' --group='a*' --shared-range-groups=1,2,3
 
@@ -19,8 +19,7 @@ whose stream column is imu, with the columns that carry data in such rows
 among the first 400 lines); raw CSV values. As upstream, each line of a
 panel is scaled separately to 0-1 of the panel (y numbers hidden), except in
 --shared-range-groups panels, which share one real range. Placement, gap breaks and min / max drawing are the same as below;
-the SNC RMS smoothing (and --rms-packets) applies to the four-panel layout
-only.
+--rms-packets (SNC RMS smoothing) applies to the four-panel layout only.
 
 mudrarecord writes railed SNC samples (-32768 / +32767) as nan; when the CSV
 has a raw_hex column the viewer reads their value from it, so railing is
@@ -39,9 +38,9 @@ acc / gyro samples are placed on the device clock when the CSV has
 device_ts: the 8 samples of a record evenly over the device-time interval
 since the previous record (the timestamp is the last sample), mapped to host
 time by a running linear fit of arrival time against device time; without
-device_ts they are placed like SNC. SNC RMS shows the RMS over the last
---rms-packets packets' rms1-3 (display only; default RMS_PACKETS, 1 draws
-each packet's values as upstream), one point per packet.
+device_ts they are placed like SNC. SNC RMS shows each packet's rms1-3, as
+upstream; with --rms-packets N the RMS over the last N packets' rms1-3
+(display only, e.g. 6 for ~100 ms), one point per packet.
 Consecutive samples more than 2x the median sample interval apart are not
 connected.
 """
@@ -67,7 +66,7 @@ LINE_WIDTH = 2.5
 RAW_LINE_WIDTH = 1             # SNC raw is a dense band; 1 px keeps a frame < 20 ms
 AXIS_WIDTH = 70                # px, same for every panel so the time axes line up
 PEAK_BINS = 400                # per curve: min and max of each bin are drawn
-RMS_PACKETS = 6                # SNC RMS display: RMS over the last 6 packets (~100 ms)
+RMS_PACKETS = 1                # SNC RMS display default: each packet's rms1-3, as upstream
 FIT_RECORDS = 2000             # device-clock fit: last 2000 records (~10 s)
 FIT_EVERY = 50                 # ... refitted every 50 records
 FIT_MIN_SPAN_US = 1e6          # nominal 1 us ticks until the fit spans 1 s
@@ -545,9 +544,9 @@ def main(argv=None):
                     help="comma-separated 1-based indices of --group panels that share "
                          "one y range, e.g. '1,2,3'")
     ap.add_argument("--rms-packets", type=int, default=None, metavar="N",
-                    help="SNC RMS panel: RMS over the last N packets' rms1-3 "
-                         f"(default {RMS_PACKETS}, ~100 ms); 1 draws each packet's "
-                         "values as upstream. Not with --group.")
+                    help="SNC RMS panel: RMS over the last N packets' rms1-3, "
+                         "e.g. 6 for ~100 ms (default 1: each packet's values, as "
+                         "upstream). Not with --group.")
     args = ap.parse_args(argv)
     if args.rms_packets is not None and args.group:
         ap.error("--rms-packets applies to the four-panel layout only, not with --group")
